@@ -408,3 +408,62 @@ The pre-compiled versions of PyTorch available on the standard Python Package In
 You also need to ensure compatibility with Jetpack. The Jetson's operating system, a customized Ubuntu operating system called JetPack, includes specific versions of CUDA, cuDNN, and TensorRT that are tailored for its mobile, power-efficient GPU. NVIDIA’s custom PyTorch builds are specifically compiled and linked against these exact libraries. This ensures a stable and high-performance bridge between the PyTorch framework and the GPU hardware. Also, during compilation, NVIDIA enables specific flags and optimizations that take advantage of the unique features of the Jetson's GPU, which are different from a desktop GPU like an RTX 4090.
 
 Therefore, when installing PyTorch and TorchVision for Jeston, you need to match your Python version and your specific Jetpack version. This effectively means you would be installing an older version of Pytorch and TorchVision on Jetson, and problems with that, such as an older version of Numpy. You need to make sure which version works with which version when working with Jetson. That part was done for you by the IA.
+
+---
+
+## Practical Notes: Running Part 2 Publisher with Remote-PC + Jetson Connectivity
+
+If your TurtleBot only has reliable connectivity to the Remote PC, run the Part 2 publisher on Jetson over SSH.
+
+### Where to run each script
+
+- **Part 2 YOLO publisher:** Run on **TurtleBot Jetson** (needs CSI camera + Jetson GPU).
+- **Part 3 autonomous subscriber/controller:** Can run on Jetson or Remote PC (with ROS 2 network configured).
+- **Part 3 visualizer:** Can run where a display + camera access is available.
+
+### Copy and run Part 2 publisher over SSH
+
+1. Copy your publisher script from Remote PC to Jetson:
+
+```bash
+scp your_part2_publisher.py nvidia@<jetson_ip>:~/
+```
+
+2. SSH into Jetson:
+
+```bash
+ssh nvidia@<jetson_ip>
+```
+
+3. Source ROS 2 Humble:
+
+```bash
+source /opt/ros/humble/setup.bash
+```
+
+4. Run publisher script:
+
+```bash
+python3 ~/your_part2_publisher.py
+```
+
+### CUDA vs TensorRT for Part 2 publisher
+
+- **CUDA (`.pt`)**: easiest for bring-up and debugging.
+- **TensorRT (`.engine`)**: usually faster once engine file is built and compatible.
+
+Recommended workflow: start with CUDA, then switch to TensorRT after your full pipeline is stable.
+
+### Topic expectations
+
+The Part 2 publisher should publish JSON `String` messages to:
+
+```text
+/yolo/detections_json
+```
+
+Then both Part 3 nodes can subscribe to the same topic.
+
+### Note on `CUDA_Demo` scripts
+
+The scripts under `Assignment_4_demo/CUDA_Demo/` are primarily camera/YOLO demos and visualization examples. They do not automatically replace your Part 2 ROS publisher unless you explicitly add ROS publishing logic.
