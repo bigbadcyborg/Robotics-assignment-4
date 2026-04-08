@@ -30,13 +30,12 @@ DESIRED_CENTER_X = IMAGE_WIDTH / 2.0
 CENTER_TOLERANCE_PX = 40.0
 DETECTION_TIMEOUT_SEC = 0.75
 
-# Distance proxy using bbox area (in pixels^2)
-GRASP_AREA_THRESHOLD = 110000.0
-APPROACH_AREA_TARGET = 90000.0
-
 # Tuned proportional gains
 KP_ANG = 0.001
-KP_LIN = 0.0015
+
+# Scripted approach/reverse distance proxy (x distance via time at fixed speed)
+SCRIPTED_TRAVEL_SPEED = 0.08  # m/s
+SCRIPTED_TRAVEL_TIME_SEC = 1.8  # x distance = speed * time
 
 # Arm/gripper presets from A3 sample workflow
 ARM_POSE_HOME = [0.0, 0.0, 0.0, 0.0]
@@ -54,16 +53,14 @@ class TaskState(Enum):
     ALIGN = auto()
     # Achieved stable center alignment lock for 3 seconds.
     LOCKED_ON = auto()
-    # Drive while maintaining center alignment.
-    APPROACH = auto()
-    # Run arm/gripper sequence to grab bottle from ground.
+    # Move forward by scripted x distance.
+    FORWARD_X = auto()
+    # Reach/open, then close gripper to grasp.
     PICK = auto()
-    # Reorient base toward drop location.
-    TURN_TO_PLACE = auto()
-    # Translate toward drop location.
-    DRIVE_TO_PLACE = auto()
-    # Run reverse arm/gripper sequence to release bottle.
-    PLACE = auto()
+    # Reverse by the same scripted x distance.
+    REVERSE_X = auto()
+    # Open gripper to release at end of reverse.
+    RELEASE = auto()
     # Final idle state: stop base motion.
     DONE = auto()
 
@@ -194,7 +191,7 @@ class AutonomousBottlePickPlace(Node):
         self._state_start_time = self._now_sec()
         self._align_centered_start_time = None
         self._pick_started = False
-        self._place_started = False
+        self._release_started = False
 
         self._control_timer = self.create_timer(0.05, self._control_loop)
         self.get_logger().info("Autonomous part 3 node started.")
@@ -259,29 +256,18 @@ class AutonomousBottlePickPlace(Node):
             return
 
         if self._state == TaskState.LOCKED_ON:
-            # Small delay or logic before immediately going to approach could go here.
-            self._transition(TaskState.APPROACH)
+            # Begin scripted pick sequence immediately after lock-on.
+            self._transition(TaskState.FORWARD_X)
             return
 
-        if self._state == TaskState.APPROACH:
-            if det is None:
-                self._transition(TaskState.SEARCH)
-                return
-
-            # Steering term keeps bottle centered while moving.
-            error_x = det.cx - DESIRED_CENTER_X
-            ang_cmd = -KP_ANG * error_x
-            # Area is a depth proxy: bigger box means object is closer.
-            area_error = APPROACH_AREA_TARGET - det.area
-            lin_cmd = KP_LIN * area_error
-
-            # Stop base once bottle is in grasping distance range.
-            if det.area >= GRASP_AREA_THRESHOLD:
+        if self._state == TaskState.FORWARD_X:
+            # Move forward x distance using a fixed speed/time profile.
+            elapsed = now - self._state_start_time
+            if elapsed < SCRIPTED_TRAVEL_TIME_SEC:
+                self._publish_twist(SCRIPTED_TRAVEL_SPEED, 0.0)
+            else:
                 self._publish_twist(0.0, 0.0)
                 self._transition(TaskState.PICK)
-                return
-
-            self._publish_twist(lin_cmd, ang_cmd)
             return
 
         if self._state == TaskState.PICK:
@@ -290,56 +276,43 @@ class AutonomousBottlePickPlace(Node):
             elapsed = now - self._state_start_time
             if not self._pick_started:
                 self._pick_started = True
-                # 1) Home + open to start from a deterministic grasp state.
-                self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=1.5)
+                # 1) Reach forward while opening gripper.
                 self._manipulator.send_gripper_goal(GRIPPER_OPEN)
-            elif elapsed > 2.0 and elapsed <= 4.5:
-                # 2) Extend arm toward bottle.
                 self._manipulator.send_arm_goal(ARM_POSE_EXTEND_FORWARD, duration_sec=2.0)
-            elif elapsed > 4.5 and elapsed <= 5.8:
-                # 3) Close gripper to grasp.
+            elif elapsed > 2.2 and elapsed <= 3.5:
+                # 2) Close gripper to grasp.
                 self._manipulator.send_gripper_goal(GRIPPER_CLOSE)
-            elif elapsed > 5.8 and elapsed <= 8.2:
-                # 4) Retract to safer carrying pose.
+            elif elapsed > 3.5 and elapsed <= 5.8:
+                # 3) Retract before reversing.
                 self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=2.0)
-            elif elapsed > 8.2:
-                self._transition(TaskState.TURN_TO_PLACE)
+            elif elapsed > 5.8:
+                self._transition(TaskState.REVERSE_X)
             return
 
-        if self._state == TaskState.TURN_TO_PLACE:
-            # Timed in-place rotation to face nominal drop zone.
+        if self._state == TaskState.REVERSE_X:
+            # Reverse the same x distance using same speed/time profile.
             elapsed = now - self._state_start_time
-            if elapsed < 3.2:
-                self._publish_twist(0.0, 0.6)
+            if elapsed < SCRIPTED_TRAVEL_TIME_SEC:
+                self._publish_twist(-SCRIPTED_TRAVEL_SPEED, 0.0)
             else:
                 self._publish_twist(0.0, 0.0)
-                self._transition(TaskState.DRIVE_TO_PLACE)
+                self._transition(TaskState.RELEASE)
             return
 
-        if self._state == TaskState.DRIVE_TO_PLACE:
-            # Timed forward motion to create transport phase.
-            elapsed = now - self._state_start_time
-            if elapsed < 1.8:
-                self._publish_twist(0.09, 0.0)
-            else:
-                self._publish_twist(0.0, 0.0)
-                self._transition(TaskState.PLACE)
-            return
-
-        if self._state == TaskState.PLACE:
+        if self._state == TaskState.RELEASE:
             self._publish_twist(0.0, 0.0)
             elapsed = now - self._state_start_time
-            if not self._place_started:
-                self._place_started = True
-                # 1) Extend toward floor.
+            if not self._release_started:
+                self._release_started = True
+                # Extend before release so drop-off happens in front of robot.
                 self._manipulator.send_arm_goal(ARM_POSE_EXTEND_FORWARD, duration_sec=2.0)
-            elif elapsed > 2.4 and elapsed <= 3.8:
-                # 2) Open to release object.
+            elif elapsed > 2.2 and elapsed <= 3.5:
+                # Open gripper only after extension is complete.
                 self._manipulator.send_gripper_goal(GRIPPER_OPEN)
-            elif elapsed > 3.8 and elapsed <= 6.0:
-                # 3) Return home.
+            elif elapsed > 3.5 and elapsed <= 5.8:
+                # Return to home after releasing.
                 self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=2.0)
-            elif elapsed > 6.0:
+            elif elapsed > 5.8:
                 self._transition(TaskState.DONE)
             return
 
