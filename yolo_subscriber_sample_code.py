@@ -22,14 +22,14 @@ class YoloJsonSubscriber(Node):
         ###############################################################
         # TODO 1: Initialize the Node with the name 'yolo_json_subscriber'
         # Hint: super().__init__('your_node_name_here')
-        
+        super().__init__('yolo_json_subscriber')
         ###############################################################
 
         ###############################################################
         # TODO 2: Create a subscriber to listen to the JSON string messages
         # Hint: self.create_subscription(MessageType, 'topic_name', callback_function, queue_size)
         # We are listening to a String, on '/yolo/detections_json', triggering `self.detection_callback`, queue of 10
-        # self.subscription = 
+        self.subscription = self.create_subscription(String, '/yolo/detections_json', self.detection_callback, 10)
         ###############################################################
       
         self.get_logger().info("Listening for YOLO JSON detections...")
@@ -39,8 +39,7 @@ class YoloJsonSubscriber(Node):
             ###############################################################
             # TODO 3: Parse the incoming JSON string back into a usable Python dictionary
             # Hint: The string is stored in msg.data. Use json.loads() on msg.data
-            # data = 
-          
+            data = json.loads(msg.data)
             ###############################################################
             
             # Extract the metadata
@@ -58,9 +57,9 @@ class YoloJsonSubscriber(Node):
                 ###############################################################
                 # TODO 4: Extract the specific values from the `det` dictionary
                 # Hint: The dictionary keys are "class_name", "confidence", and "bbox"
-                # class_name = det[       ]
-                # score = det[       ]
-                # bbox = det[      ] 
+                class_name = det['class_name']
+                score = det['confidence']
+                bbox = det['bbox']
                 ###############################################################
                 
                 self.get_logger().info(
@@ -76,7 +75,7 @@ def main(args=None):
     ###############################################################
     # TODO 5: Initialize the ROS 2 Python client library
     # Hint: rclpy.init with necessary arguments (args)
-    
+    rclpy.init(args=args)
     ###############################################################
     node = YoloJsonSubscriber()
     
@@ -84,7 +83,7 @@ def main(args=None):
         ###############################################################
         # TODO 6: Spin the node so it stays alive and continues to trigger the timer
         # Hint: rclpy.spin with the necessary arguments that define what to spin
-        
+        rclpy.spin(node)
         ###############################################################
     except KeyboardInterrupt:
         pass

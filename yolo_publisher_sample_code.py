@@ -24,7 +24,7 @@ class YoloJsonPublisher(Node):
         ###############################################################
         # TODO 1: Initialize the Node with the name 'yolo_json_publisher'
         # Hint: super().__init__('your_node_name_here')
-      
+        super().__init__('yolo_json_publisher')
         ###############################################################
 
 
@@ -34,7 +34,7 @@ class YoloJsonPublisher(Node):
         # Hint: self.create_publisher(MessageType, 'topic_name', queue_size)
         # We want to publish a String, to '/yolo/detections_json', with a queue of 10
         
-        # self.publisher_ = 
+        self.publisher_ = self.create_publisher(String, '/yolo/detections_json', 10)
         ###############################################################
         
         # Load YOLOv11 base model (Not Pose, Not Seg) onto the Jetson's GPU
@@ -48,14 +48,14 @@ class YoloJsonPublisher(Node):
 
         # Note: It would take a long time to load the model when it is your first time. 
         
-        # Option 1: CUDA:               self.model = YOLO('yolo11n.pt')
+        # Option 1: CUDA:               self.model = YOLO('yolo11s.pt')
         #                               self.model.to('cuda:0')
         
         # Works only if you have created the engine file using the provided demo code and copied it to the same folder as this code.
-        # Option 2: CUDA+TensorRT:      self.model = YOLO('yolo11n.engine') 
+        # Option 2: CUDA+TensorRT:      self.model = YOLO('yolo11s.engine') 
         
-        # self.model =
-
+        self.model = YOLO('yolo11s.pt')
+        self.model.to('cuda:0')
         ###############################################################
         
         
@@ -77,7 +77,7 @@ class YoloJsonPublisher(Node):
         # TODO 4: Create a timer that triggers your callback function to capture frames
         # Hint: self.create_timer(timer_period_in_seconds, callback_function)
         # Set it to run every 0.05 seconds (20 Hz), and call `self.timer_callback`
-        # self.timer = 
+        self.timer = self.create_timer(0.05, self.timer_callback)
   
         ###############################################################
 
@@ -111,7 +111,7 @@ class YoloJsonPublisher(Node):
         ###############################################################
         # TODO 5: Convert the `detection_data` Python dictionary into a JSON formatted string
         # Hint: Use the json.dumps() function
-        # json_str = 
+        json_str = json.dumps(detection_data)
       
         ###############################################################
       
@@ -122,9 +122,9 @@ class YoloJsonPublisher(Node):
         # msg.data = your_json_string
         # self.publisher_.publish(msg_variable)
       
-        # msg = 
-        # msg.data = 
-        # self.publisher_.publish()
+        msg = String()
+        msg.data = json_str
+        self.publisher_.publish(msg)
         ###############################################################
 
     def destroy_node(self):
@@ -136,7 +136,7 @@ def main(args=None):
         ###############################################################
         # TODO 7: Initialize the ROS 2 Python client library
         # Hint: rclpy.init with necessary arguments (args)
-        
+        rclpy.init(args=args)
         ###############################################################
     
         node = YoloJsonPublisher()
@@ -146,7 +146,7 @@ def main(args=None):
             ###############################################################
             # TODO 8: Spin the node so it stays alive and continues to trigger the timer
             # Hint: rclpy.spin with the necessary arguments that define what to spin
-          
+            rclpy.spin(node)
             ###############################################################
             
         except KeyboardInterrupt:
