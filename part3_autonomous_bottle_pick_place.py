@@ -35,7 +35,7 @@ GRASP_AREA_THRESHOLD = 110000.0
 APPROACH_AREA_TARGET = 90000.0
 
 # Tuned proportional gains
-KP_ANG = 0.004
+KP_ANG = 0.001
 KP_LIN = 0.0015
 
 # Arm/gripper presets from A3 sample workflow
@@ -52,6 +52,8 @@ class TaskState(Enum):
     SEARCH = auto()
     # Keep bottle centered in camera before driving forward.
     ALIGN = auto()
+    # Achieved stable center alignment lock for 3 seconds.
+    LOCKED_ON = auto()
     # Drive while maintaining center alignment.
     APPROACH = auto()
     # Run arm/gripper sequence to grab bottle from ground.
@@ -190,6 +192,7 @@ class AutonomousBottlePickPlace(Node):
 
         self._state = TaskState.SEARCH
         self._state_start_time = self._now_sec()
+        self._align_centered_start_time = None
         self._pick_started = False
         self._place_started = False
 
@@ -234,15 +237,30 @@ class AutonomousBottlePickPlace(Node):
         if self._state == TaskState.ALIGN:
             # If we lose the target, restart search behavior.
             if det is None:
+                self._align_centered_start_time = None
                 self._transition(TaskState.SEARCH)
                 return
             # Horizontal pixel error drives proportional angular correction.
             error_x = det.cx - DESIRED_CENTER_X
             if math.fabs(error_x) <= CENTER_TOLERANCE_PX:
+                if self._align_centered_start_time is None:
+                    self._align_centered_start_time = now
+                elif now - self._align_centered_start_time >= 3.0:
+                    self._publish_twist(0.0, 0.0)
+                    self._align_centered_start_time = None
+                    self._transition(TaskState.LOCKED_ON)
+                    return
+                # Stop rotating while in the center tolerance to build up the 3 seconds
                 self._publish_twist(0.0, 0.0)
-                self._transition(TaskState.APPROACH)
                 return
-            self._publish_twist(0.0, -KP_ANG * error_x)
+            else:
+                self._align_centered_start_time = None
+                self._publish_twist(0.0, -KP_ANG * error_x)
+            return
+
+        if self._state == TaskState.LOCKED_ON:
+            # Small delay or logic before immediately going to approach could go here.
+            self._transition(TaskState.APPROACH)
             return
 
         if self._state == TaskState.APPROACH:
