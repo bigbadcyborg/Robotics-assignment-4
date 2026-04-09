@@ -9,7 +9,7 @@ import json
 import math
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -88,26 +88,42 @@ class BottleTracker:
         self._best_detection: Optional[Detection] = None
         self._last_update_time: float = 0.0
 
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def update_from_json(self, payload: str, now_sec: float) -> None:
         # Payload format is the same JSON schema emitted by Part 2 publisher.
         data = json.loads(payload)
         detections = data.get("detections", [])
+        if not isinstance(detections, list):
+            detections = []
 
         # Filter to target class only; Part 3 objective is bottle pickup.
         bottle_candidates: List[Detection] = []
         for det in detections:
+            if not isinstance(det, dict):
+                continue
+
             class_name = str(det.get("class_name", "")).lower()
             if class_name != "bottle":
                 continue
+
             bbox = det.get("bbox", {})
+            if not isinstance(bbox, dict):
+                bbox = {}
+
             bottle_candidates.append(
                 Detection(
                     class_name=class_name,
-                    confidence=float(det.get("confidence", 0.0)),
-                    cx=float(bbox.get("cx", 0.0)),
-                    cy=float(bbox.get("cy", 0.0)),
-                    w=float(bbox.get("w", 0.0)),
-                    h=float(bbox.get("h", 0.0)),
+                    confidence=self._to_float(det.get("confidence", 0.0)),
+                    cx=self._to_float(bbox.get("cx", 0.0)),
+                    cy=self._to_float(bbox.get("cy", 0.0)),
+                    w=max(0.0, self._to_float(bbox.get("w", 0.0))),
+                    h=max(0.0, self._to_float(bbox.get("h", 0.0))),
                 )
             )
 
@@ -190,8 +206,8 @@ class AutonomousBottlePickPlace(Node):
         self._state = TaskState.SEARCH
         self._state_start_time = self._now_sec()
         self._align_centered_start_time = None
-        self._pick_started = False
-        self._release_started = False
+        self._pick_stage = 0
+        self._release_stage = 0
 
         self._control_timer = self.create_timer(0.05, self._control_loop)
         self.get_logger().info("Autonomous part 3 node started.")
@@ -203,8 +219,8 @@ class AutonomousBottlePickPlace(Node):
         # Keep callback focused on perception ingestion only (SRP).
         try:
             self._tracker.update_from_json(msg.data, self._now_sec())
-        except json.JSONDecodeError as exc:
-            self.get_logger().warn(f"Invalid JSON from YOLO publisher: {exc}")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self.get_logger().warn(f"Invalid detection payload from YOLO publisher: {exc}")
 
     def _publish_twist(self, linear_x: float, angular_z: float) -> None:
         # Clamp commands to TurtleBot3 Burger limits for safety.
@@ -217,6 +233,12 @@ class AutonomousBottlePickPlace(Node):
         # Centralizing transition logic keeps timing code consistent.
         self._state = new_state
         self._state_start_time = self._now_sec()
+
+        if new_state != TaskState.PICK:
+            self._pick_stage = 0
+        if new_state != TaskState.RELEASE:
+            self._release_stage = 0
+
         self.get_logger().info(f"Transition -> {new_state.name}")
 
     def _control_loop(self) -> None:
@@ -274,17 +296,20 @@ class AutonomousBottlePickPlace(Node):
             # Keep base stationary during arm operations.
             self._publish_twist(0.0, 0.0)
             elapsed = now - self._state_start_time
-            if not self._pick_started:
-                self._pick_started = True
+
+            if self._pick_stage == 0:
                 # 1) Reach forward while opening gripper.
                 self._manipulator.send_gripper_goal(GRIPPER_OPEN)
                 self._manipulator.send_arm_goal(ARM_POSE_EXTEND_FORWARD, duration_sec=2.0)
-            elif elapsed > 2.2 and elapsed <= 3.5:
-                # 2) Close gripper to grasp.
+                self._pick_stage = 1
+            elif self._pick_stage == 1 and elapsed > 2.2:
+                # 2) Close gripper once to grasp.
                 self._manipulator.send_gripper_goal(GRIPPER_CLOSE)
-            elif elapsed > 3.5 and elapsed <= 5.8:
-                # 3) Retract before reversing.
+                self._pick_stage = 2
+            elif self._pick_stage == 2 and elapsed > 3.5:
+                # 3) Retract once before reversing.
                 self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=2.0)
+                self._pick_stage = 3
             elif elapsed > 5.8:
                 self._transition(TaskState.REVERSE_X)
             return
@@ -302,16 +327,19 @@ class AutonomousBottlePickPlace(Node):
         if self._state == TaskState.RELEASE:
             self._publish_twist(0.0, 0.0)
             elapsed = now - self._state_start_time
-            if not self._release_started:
-                self._release_started = True
+
+            if self._release_stage == 0:
                 # Extend before release so drop-off happens in front of robot.
                 self._manipulator.send_arm_goal(ARM_POSE_EXTEND_FORWARD, duration_sec=2.0)
-            elif elapsed > 2.2 and elapsed <= 3.5:
-                # Open gripper only after extension is complete.
+                self._release_stage = 1
+            elif self._release_stage == 1 and elapsed > 2.2:
+                # Open gripper once after extension is complete.
                 self._manipulator.send_gripper_goal(GRIPPER_OPEN)
-            elif elapsed > 3.5 and elapsed <= 5.8:
-                # Return to home after releasing.
+                self._release_stage = 2
+            elif self._release_stage == 2 and elapsed > 3.5:
+                # Return to home once after releasing.
                 self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=2.0)
+                self._release_stage = 3
             elif elapsed > 5.8:
                 self._transition(TaskState.DONE)
             return
