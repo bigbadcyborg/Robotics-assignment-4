@@ -12,148 +12,233 @@
 # This will be a harder coding assignment compared to Milestone Assignment 3.
 # We recommend doing a revision on the Milestone Assignment 3 code to get a hang of coding in ROS2.
 
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+import cv2
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String  
-import cv2
-import json  
+from std_msgs.msg import String
 from ultralytics import YOLO
 
-class YoloJsonPublisher(Node):
-    def __init__(self):
-        ###############################################################
-        # TODO 1: Initialize the Node with the name 'yolo_json_publisher'
-        # Hint: super().__init__('your_node_name_here')
-        super().__init__('yolo_json_publisher')
-        ###############################################################
+
+@dataclass(frozen=True)
+class PublisherConfig:
+    """Runtime configuration exposed as ROS parameters."""
+
+    model_path: str
+    backend: str
+    topic: str
+    timer_period_sec: float
+    frame_id: str
 
 
-      
-        ###############################################################
-        # TODO 2: Create a publisher that sends standard String messages
-        # Hint: self.create_publisher(MessageType, 'topic_name', queue_size)
-        # We want to publish a String, to '/yolo/detections_json', with a queue of 10
-        
-        self.publisher_ = self.create_publisher(String, '/yolo/detections_json', 10)
-        ###############################################################
-        
-        # Load YOLOv11 base model (Not Pose, Not Seg) onto the Jetson's GPU
-        self.get_logger().info("Loading YOLOv11 model on CUDA...")
-        
-        ###############################################################
-        # TODO 3: Select a model name and size to run. yolo11n (nano) would serve you well, but you can use a different model.
-        # Also, select the optimization level you want for YOLO v11
-        # CUDA - Use Nvidia GPU without optimizations
-        # CUDA+TensorRT - Use Nvidia GPU with performance optimization
+class DetectionSerializer:
+    """Converts model output into assignment-compatible JSON payloads."""
 
-        # Note: It would take a long time to load the model when it is your first time. 
-        
-        # Option 1: CUDA:               self.model = YOLO('yolo11s.pt')
-        #                               self.model.to('cuda:0')
-        
-        # Works only if you have created the engine file using the provided demo code and copied it to the same folder as this code.
-        # Option 2: CUDA+TensorRT:      self.model = YOLO('yolo11s.engine') 
-        
-        self.model = YOLO('yolo11s.pt')
-        self.model.to('cuda:0')
-        ###############################################################
-        
-        
-        # GStreamer pipeline for Raspberry Pi V2 Camera on Jetson CSI port
-        gstreamer_pipeline = (
-            "nvarguscamerasrc ! "
-            "video/x-raw(memory:NVMM), width=(int)1280, height=(int)720, format=(string)NV12, framerate=(fraction)30/1 ! "
-            "nvvidconv ! "
-            "video/x-raw, format=(string)BGRx ! "
-            "videoconvert ! "
-            "video/x-raw, format=(string)BGR ! appsink"
-        )
-        
-        self.cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
-        if not self.cap.isOpened():
-            self.get_logger().error("Failed to open camera.")
-            return
-        ###############################################################
-        # TODO 4: Create a timer that triggers your callback function to capture frames
-        # Hint: self.create_timer(timer_period_in_seconds, callback_function)
-        # Set it to run every 0.05 seconds (20 Hz), and call `self.timer_callback`
-        self.timer = self.create_timer(0.05, self.timer_callback)
-  
-        ###############################################################
+    def __init__(self, frame_id: str) -> None:
+        self._frame_id = frame_id
 
-    def timer_callback(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return
-
-        # Run YOLO inference
-        results = self.model(frame, verbose=False)[0]
-
-        # Initialize the dictionary to hold our data
-        detection_data = {
-            "timestamp": self.get_clock().now().nanoseconds / 1e9,
-            "frame_id": "camera_link",
-            "detections": []
+    def to_json(self, names: Dict[int, str], boxes: Any, timestamp_sec: float) -> str:
+        detection_data: Dict[str, Any] = {
+            "timestamp": timestamp_sec,
+            "frame_id": self._frame_id,
+            "detections": [],
         }
 
-        # Populate the dictionary with YOLO results
-        for box in results.boxes:
+        for box in boxes:
             x_center, y_center, width, height = box.xywh[0].tolist()
             class_id = int(box.cls[0].item())
             confidence = float(box.conf[0].item())
+            class_name = names.get(class_id, str(class_id))
+            detection_data["detections"].append(
+                {
+                    "class_name": class_name,
+                    "confidence": confidence,
+                    "bbox": {
+                        "cx": x_center,
+                        "cy": y_center,
+                        "w": width,
+                        "h": height,
+                    },
+                }
+            )
 
-            detection_data["detections"].append({
-                "class_name": self.model.names[class_id],
-                "confidence": confidence,
-                "bbox": {"cx": x_center, "cy": y_center, "w": width, "h": height}
-            })
-            
-        ###############################################################
-        # TODO 5: Convert the `detection_data` Python dictionary into a JSON formatted string
-        # Hint: Use the json.dumps() function
-        json_str = json.dumps(detection_data)
-      
-        ###############################################################
-      
-        ###############################################################
-        # TODO 6: Create your ROS 2 String message and publish it
-        # Hint:
-        # msg = String()
-        # msg.data = your_json_string
-        # self.publisher_.publish(msg_variable)
-      
+        return json.dumps(detection_data)
+
+
+class YoloDetector:
+    """Encapsulates model loading and frame inference."""
+
+    def __init__(self, model_path: str, backend: str, logger: Any) -> None:
+        self._logger = logger
+        self._backend = backend.lower().strip()
+        self._model = YOLO(model_path)
+        self._configure_backend()
+
+    @property
+    def model_names(self) -> Dict[int, str]:
+        return self._model.names
+
+    def infer(self, frame: Any) -> Any:
+        return self._model(frame, verbose=False)[0]
+
+    def _configure_backend(self) -> None:
+        if self._backend == "cuda":
+            self._logger.info("Using CUDA backend for YOLO inference")
+            self._model.to("cuda:0")
+        elif self._backend == "cpu":
+            self._logger.info("Using CPU backend for YOLO inference")
+            self._model.to("cpu")
+        elif self._backend == "tensorrt":
+            self._logger.info(
+                "Using TensorRT backend (engine model expected, no .to() call required)"
+            )
+        elif self._backend == "auto":
+            self._logger.info(
+                "Using AUTO backend (model default runtime selection by Ultralytics)"
+            )
+        else:
+            self._logger.warn(
+                f"Unsupported backend '{self._backend}'. Falling back to CUDA."
+            )
+            self._backend = "cuda"
+            self._model.to("cuda:0")
+
+
+class CsiCameraSource:
+    """Owns camera lifecycle and frame acquisition from Jetson CSI input."""
+
+    GSTREAMER_PIPELINE = (
+        "nvarguscamerasrc ! "
+        "video/x-raw(memory:NVMM), width=(int)1280, height=(int)720, "
+        "format=(string)NV12, framerate=(fraction)30/1 ! "
+        "nvvidconv ! "
+        "video/x-raw, format=(string)BGRx ! "
+        "videoconvert ! "
+        "video/x-raw, format=(string)BGR ! appsink"
+    )
+
+    def __init__(self, logger: Any) -> None:
+        self._logger = logger
+        self._cap = cv2.VideoCapture(self.GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
+        if not self._cap.isOpened():
+            raise RuntimeError("Failed to open camera.")
+
+    def read(self) -> Any:
+        return self._cap.read()
+
+    def release(self) -> None:
+        self._cap.release()
+
+
+class YoloJsonPublisher(Node):
+    def __init__(self):
+        super().__init__("yolo_json_publisher")
+
+        self._config = self._load_config()
+        self.publisher_ = self.create_publisher(String, self._config.topic, 10)
+        self._serializer = DetectionSerializer(frame_id=self._config.frame_id)
+
+        self.get_logger().info(
+            "Loading YOLO model with parameters: "
+            f"model_path={self._config.model_path}, backend={self._config.backend}, "
+            f"topic={self._config.topic}, timer_period={self._config.timer_period_sec:.3f}s"
+        )
+
+        self._detector = YoloDetector(
+            model_path=self._config.model_path,
+            backend=self._config.backend,
+            logger=self.get_logger(),
+        )
+        self._camera = CsiCameraSource(logger=self.get_logger())
+        self.timer = self.create_timer(self._config.timer_period_sec, self.timer_callback)
+
+    def _load_config(self) -> PublisherConfig:
+        self.declare_parameter("model_path", "yolo11s.pt")
+        self.declare_parameter("backend", "cuda")
+        self.declare_parameter("topic", "/yolo/detections_json")
+        self.declare_parameter("timer_period_sec", 0.05)
+        self.declare_parameter("frame_id", "camera_link")
+
+        model_path = self.get_parameter("model_path").get_parameter_value().string_value
+        backend = self.get_parameter("backend").get_parameter_value().string_value
+        topic = self.get_parameter("topic").get_parameter_value().string_value
+        timer_period_sec = (
+            self.get_parameter("timer_period_sec")
+            .get_parameter_value()
+            .double_value
+        )
+        frame_id = self.get_parameter("frame_id").get_parameter_value().string_value
+
+        if timer_period_sec <= 0.0:
+            self.get_logger().warn(
+                f"timer_period_sec={timer_period_sec} is invalid. Using default 0.05."
+            )
+            timer_period_sec = 0.05
+
+        if not topic:
+            self.get_logger().warn("Empty topic parameter received. Using /yolo/detections_json.")
+            topic = "/yolo/detections_json"
+
+        if not model_path:
+            self.get_logger().warn("Empty model_path parameter received. Using yolo11s.pt.")
+            model_path = "yolo11s.pt"
+
+        return PublisherConfig(
+            model_path=model_path,
+            backend=backend,
+            topic=topic,
+            timer_period_sec=timer_period_sec,
+            frame_id=frame_id,
+        )
+
+    def timer_callback(self):
+        ret, frame = self._camera.read()
+        if not ret:
+            self.get_logger().warn("Camera frame read failed; skipping this cycle.")
+            return
+
+        try:
+            results = self._detector.infer(frame)
+            json_str = self._serializer.to_json(
+                names=self._detector.model_names,
+                boxes=results.boxes,
+                timestamp_sec=self.get_clock().now().nanoseconds / 1e9,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"Inference/publish preparation failed: {exc}")
+            return
+
         msg = String()
         msg.data = json_str
         self.publisher_.publish(msg)
-        ###############################################################
 
     def destroy_node(self):
-        self.cap.release()
+        self._camera.release()
         super().destroy_node()
 
-def main(args=None):
-    
-        ###############################################################
-        # TODO 7: Initialize the ROS 2 Python client library
-        # Hint: rclpy.init with necessary arguments (args)
-        rclpy.init(args=args)
-        ###############################################################
-    
-        node = YoloJsonPublisher()
-        
-        try:
-            
-            ###############################################################
-            # TODO 8: Spin the node so it stays alive and continues to trigger the timer
-            # Hint: rclpy.spin with the necessary arguments that define what to spin
-            rclpy.spin(node)
-            ###############################################################
-            
-        except KeyboardInterrupt:
-            pass
-        finally:
-            node.destroy_node()
-            rclpy.shutdown()
 
-if __name__ == '__main__':
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = None
+    try:
+        node = YoloJsonPublisher()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        if node is not None:
+            node.get_logger().error(f"Node startup/runtime failure: {exc}")
+        else:
+            print(f"Node startup failure: {exc}")
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
     main()
