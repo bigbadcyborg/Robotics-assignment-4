@@ -40,7 +40,9 @@ class DetectionSerializer:
     def __init__(self, frame_id: str) -> None:
         self._frame_id = frame_id
 
-    def to_json(self, names: Dict[int, str], boxes: Any, timestamp_sec: float) -> str:
+    def to_payload(
+        self, names: Dict[int, str], boxes: Any, timestamp_sec: float
+    ) -> Dict[str, Any]:
         detection_data: Dict[str, Any] = {
             "timestamp": timestamp_sec,
             "frame_id": self._frame_id,
@@ -65,7 +67,10 @@ class DetectionSerializer:
                 }
             )
 
-        return json.dumps(detection_data)
+        return detection_data
+
+    def to_json(self, detection_payload: Dict[str, Any]) -> str:
+        return json.dumps(detection_payload)
 
 
 class YoloDetector:
@@ -202,11 +207,12 @@ class YoloJsonPublisher(Node):
 
         try:
             results = self._detector.infer(frame)
-            json_str = self._serializer.to_json(
+            detection_payload = self._serializer.to_payload(
                 names=self._detector.model_names,
                 boxes=results.boxes,
                 timestamp_sec=self.get_clock().now().nanoseconds / 1e9,
             )
+            json_str = self._serializer.to_json(detection_payload)
         except Exception as exc:
             self.get_logger().error(f"Inference/publish preparation failed: {exc}")
             return
@@ -214,6 +220,19 @@ class YoloJsonPublisher(Node):
         msg = String()
         msg.data = json_str
         self.publisher_.publish(msg)
+        self._log_published_detections(detection_payload)
+
+    def _log_published_detections(self, detection_payload: Dict[str, Any]) -> None:
+        detections = detection_payload.get("detections", [])
+        if not detections:
+            self.get_logger().info("Published detections: none")
+            return
+
+        formatted_detections = ", ".join(
+            f"{detection['class_name']} ({detection['confidence']:.2f})"
+            for detection in detections
+        )
+        self.get_logger().info(f"Published detections: {formatted_detections}")
 
     def destroy_node(self):
         self._camera.release()
