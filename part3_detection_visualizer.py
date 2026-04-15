@@ -58,10 +58,16 @@ class DetectionCache:
     def update_from_json(self, payload: str, now_sec: float) -> None:
         data = json.loads(payload)
         detections = data.get("detections", [])
+        if not isinstance(detections, list):
+            detections = []
         parsed: List[Detection] = []
 
         for det in detections:
+            if not isinstance(det, dict):
+                continue
             bbox = det.get("bbox", {})
+            if not isinstance(bbox, dict):
+                bbox = {}
             parsed.append(
                 Detection(
                     class_name=str(det.get("class_name", "unknown")),
@@ -108,7 +114,7 @@ class Part3DetectionVisualizer(Node):
     def _on_detections(self, msg: String) -> None:
         try:
             self._cache.update_from_json(msg.data, time.time())
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
             self.get_logger().warn(f"JSON parse error: {exc}")
 
     def render_once(self) -> bool:
