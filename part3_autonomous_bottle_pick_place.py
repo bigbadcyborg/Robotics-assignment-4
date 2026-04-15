@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """Autonomous bottle pick-and-place for TurtleBot3 + OpenManipulator.
 
-Builds on Assignment 3 teleop motion/manipulator primitives and
-Assignment 4 YOLO JSON subscriber format.
+Program overview:
+1) SEARCH: rotate in place until a bottle detection is available.
+2) ALIGN: keep the bottle centered in the camera for a stable lock-on.
+3) LOST_TARGET: if the bottle disappears for consecutive frames, run a short
+   recovery sweep before returning to broad search.
+4) FORWARD_X: drive forward by a scripted distance profile.
+5) PRE_PICK_HOME: move arm to home and open gripper to normalize posture.
+6) PICK: extend arm, close gripper to grasp, then retract.
+7) REVERSE_X: drive back using the same scripted distance profile.
+8) RELEASE: extend, open gripper to place object, and retract.
+9) DONE: hold zero base velocity in a safe idle state.
+
+This node builds on Assignment 3 teleop motion/manipulator primitives and
+Assignment 4 YOLO JSON subscriber format while keeping responsibilities
+separated across perception ingestion, state transitions, and actuation.
 """
 
 import json
@@ -29,6 +42,8 @@ IMAGE_WIDTH = 1280.0
 DESIRED_CENTER_X = IMAGE_WIDTH / 2.0
 CENTER_TOLERANCE_PX = 40.0
 DETECTION_TIMEOUT_SEC = 0.75
+LOST_TARGET_RECOVERY_SEC = 1.0
+LOST_TARGET_CONSECUTIVE_FRAMES = 5
 
 # Tuned proportional gains
 KP_ANG = 0.001
@@ -51,10 +66,14 @@ class TaskState(Enum):
     SEARCH = auto()
     # Keep bottle centered in camera before driving forward.
     ALIGN = auto()
+    # Short recovery sweep when bottle is temporarily lost.
+    LOST_TARGET = auto()
     # Achieved stable center alignment lock for 3 seconds.
     LOCKED_ON = auto()
     # Move forward by scripted x distance.
     FORWARD_X = auto()
+    # Normalize arm before extension for deterministic pickup.
+    PRE_PICK_HOME = auto()
     # Reach/open, then close gripper to grasp.
     PICK = auto()
     # Reverse by the same scripted x distance.
@@ -208,6 +227,9 @@ class AutonomousBottlePickPlace(Node):
         self._align_centered_start_time = None
         self._pick_stage = 0
         self._release_stage = 0
+        self._pre_pick_sent = False
+        self._pre_pick_next_state = TaskState.PICK
+        self._lost_target_frames = 0
 
         self._control_timer = self.create_timer(0.05, self._control_loop)
         self.get_logger().info("Autonomous part 3 node started.")
@@ -238,6 +260,10 @@ class AutonomousBottlePickPlace(Node):
             self._pick_stage = 0
         if new_state != TaskState.RELEASE:
             self._release_stage = 0
+        if new_state != TaskState.PRE_PICK_HOME:
+            self._pre_pick_sent = False
+        if new_state != TaskState.ALIGN:
+            self._lost_target_frames = 0
 
         self.get_logger().info(f"Transition -> {new_state.name}")
 
@@ -256,9 +282,16 @@ class AutonomousBottlePickPlace(Node):
         if self._state == TaskState.ALIGN:
             # If we lose the target, restart search behavior.
             if det is None:
+                self._lost_target_frames += 1
                 self._align_centered_start_time = None
-                self._transition(TaskState.SEARCH)
+                if self._lost_target_frames >= LOST_TARGET_CONSECUTIVE_FRAMES:
+                    self._transition(TaskState.LOST_TARGET)
+                else:
+                    # Hold position briefly to tolerate transient dropped detections.
+                    self._publish_twist(0.0, 0.0)
                 return
+
+            self._lost_target_frames = 0
             # Horizontal pixel error drives proportional angular correction.
             error_x = det.cx - DESIRED_CENTER_X
             if math.fabs(error_x) <= CENTER_TOLERANCE_PX:
@@ -277,6 +310,19 @@ class AutonomousBottlePickPlace(Node):
                 self._publish_twist(0.0, -KP_ANG * error_x)
             return
 
+        if self._state == TaskState.LOST_TARGET:
+            # Briefly sweep to reacquire the bottle before broad search.
+            if det is not None:
+                self._transition(TaskState.ALIGN)
+                return
+
+            elapsed = now - self._state_start_time
+            if elapsed < LOST_TARGET_RECOVERY_SEC:
+                self._publish_twist(0.0, 0.25)
+            else:
+                self._transition(TaskState.SEARCH)
+            return
+
         if self._state == TaskState.LOCKED_ON:
             # Begin scripted pick sequence immediately after lock-on.
             self._transition(TaskState.FORWARD_X)
@@ -289,7 +335,20 @@ class AutonomousBottlePickPlace(Node):
                 self._publish_twist(SCRIPTED_TRAVEL_SPEED, 0.0)
             else:
                 self._publish_twist(0.0, 0.0)
-                self._transition(TaskState.PICK)
+                self._pre_pick_next_state = TaskState.PICK
+                self._transition(TaskState.PRE_PICK_HOME)
+            return
+
+        if self._state == TaskState.PRE_PICK_HOME:
+            # Return to a known-safe posture before pickup extension.
+            self._publish_twist(0.0, 0.0)
+            elapsed = now - self._state_start_time
+            if not self._pre_pick_sent:
+                self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=1.8)
+                self._manipulator.send_gripper_goal(GRIPPER_OPEN)
+                self._pre_pick_sent = True
+            elif elapsed > 2.0:
+                self._transition(self._pre_pick_next_state)
             return
 
         if self._state == TaskState.PICK:
@@ -341,7 +400,8 @@ class AutonomousBottlePickPlace(Node):
                 self._manipulator.send_arm_goal(ARM_POSE_HOME, duration_sec=2.0)
                 self._release_stage = 3
             elif elapsed > 5.8:
-                self._transition(TaskState.DONE)
+                self._pre_pick_next_state = TaskState.DONE
+                self._transition(TaskState.PRE_PICK_HOME)
             return
 
         if self._state == TaskState.DONE:
