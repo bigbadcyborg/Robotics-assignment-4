@@ -20,10 +20,14 @@ separated across perception ingestion, state transitions, and actuation.
 
 import json
 import math
+import os
+import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, List, Optional
 
+import cv2
+import numpy as np
 import rclpy
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory, GripperCommand
@@ -32,13 +36,17 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
+from ultralytics import YOLO
+
+# Re-introduce the deprecated alias so TRT's __init__ can find it
+np.bool = bool
 
 # Motion limits (Burger)
 BURGER_MAX_LIN_VEL = 0.22
 BURGER_MAX_ANG_VEL = 2.84
 
 # Camera / detection assumptions
-IMAGE_WIDTH = 1280.0
+IMAGE_WIDTH = 640.0
 DESIRED_CENTER_X = IMAGE_WIDTH / 2.0
 CENTER_TOLERANCE_PX = 40.0
 DETECTION_TIMEOUT_SEC = 0.75
@@ -114,37 +122,30 @@ class BottleTracker:
         except (TypeError, ValueError):
             return default
 
-    def update_from_json(self, payload: str, now_sec: float) -> None:
-        # Payload format is the same JSON schema emitted by Part 2 publisher.
-        data = json.loads(payload)
-        detections = data.get("detections", [])
-        if not isinstance(detections, list):
-            detections = []
-
-        # Filter to target class only; Part 3 objective is bottle pickup.
+    def update_from_inference(self, results: Any, now_sec: float) -> None:
         bottle_candidates: List[Detection] = []
-        for det in detections:
-            if not isinstance(det, dict):
-                continue
-
-            class_name = str(det.get("class_name", "")).lower()
-            if class_name != "bottle":
-                continue
-
-            bbox = det.get("bbox", {})
-            if not isinstance(bbox, dict):
-                bbox = {}
-
-            bottle_candidates.append(
-                Detection(
-                    class_name=class_name,
-                    confidence=self._to_float(det.get("confidence", 0.0)),
-                    cx=self._to_float(bbox.get("cx", 0.0)),
-                    cy=self._to_float(bbox.get("cy", 0.0)),
-                    w=max(0.0, self._to_float(bbox.get("w", 0.0))),
-                    h=max(0.0, self._to_float(bbox.get("h", 0.0))),
-                )
-            )
+        if len(results) > 0:
+            result = results[0]
+            names = result.names
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls.item())
+                    class_name = names[class_id].lower()
+                    if class_name != "bottle":
+                        continue
+                    
+                    xywh = box.xywh[0]
+                    confidence = float(box.conf.item())
+                    bottle_candidates.append(
+                        Detection(
+                            class_name=class_name,
+                            confidence=confidence,
+                            cx=float(xywh[0].item()),
+                            cy=float(xywh[1].item()),
+                            w=float(xywh[2].item()),
+                            h=float(xywh[3].item()),
+                        )
+                    )
 
         self._best_detection = max(
             bottle_candidates,
@@ -214,10 +215,34 @@ class AutonomousBottlePickPlace(Node):
         super().__init__("autonomous_bottle_pick_place")
         # Publisher for differential-drive base control.
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        # Subscriber to YOLO JSON detections produced by Part 2 publisher.
-        self._sub = self.create_subscription(
-            String, "/yolo/detections_json", self._on_detections, 10
+
+        # Path to the TensorRT engine
+        engine_path = "yolo11n.engine"
+        pt_path     = "yolo11n.pt"
+
+        # Export if needed
+        if not os.path.isfile(engine_path):
+            self.get_logger().info(f"[INFO] {engine_path} not found, exporting from {pt_path} ...")
+            YOLO(pt_path).export(format="engine")
+
+        # Load the TensorRT engine
+        self._model = YOLO(engine_path, task='detect')
+
+        # Open camera (Jetson uses GStreamer pipeline and is not same as normal webcam pipeline)
+        gst = (
+            "nvarguscamerasrc sensor-mode=4 ! "                               
+            "nvvidconv flip-method=0 ! "                                      
+            "video/x-raw(memory:NVMM),width=(int)640,height=(int)480,framerate=(fraction)30/1 ! " 
+            "nvvidconv ! "                                                    
+            "video/x-raw,format=(string)BGRx ! "
+            "videoconvert ! "
+            "video/x-raw,format=(string)BGR ! "
+            "appsink drop=1"
         )
+
+        self._cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        if not self._cap.isOpened():
+            self.get_logger().error("Error: unable to open camera")
 
         self._tracker = BottleTracker()
         self._manipulator = ManipulatorClient(self)
@@ -237,12 +262,32 @@ class AutonomousBottlePickPlace(Node):
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
 
-    def _on_detections(self, msg: String) -> None:
-        # Keep callback focused on perception ingestion only (SRP).
-        try:
-            self._tracker.update_from_json(msg.data, self._now_sec())
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self.get_logger().warn(f"Invalid detection payload from YOLO publisher: {exc}")
+    def _process_frame(self) -> None:
+        if self._cap is None or not self._cap.isOpened():
+            return
+        
+        ret, frame = self._cap.read()
+        if not ret:
+            return
+
+        start = time.time()
+        results = self._model(frame, verbose=False)
+        end = time.time()
+
+        self._tracker.update_from_inference(results, self._now_sec())
+
+        annotated = results[0].plot()
+        fps = 1.0 / max(1e-5, (end - start))
+        cv2.putText(
+            annotated,
+            f"FPS: {fps:.1f}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1, (0, 255, 0), 2
+        )
+        
+        cv2.imshow("YOLO11 Autonomous Bottle Pick Place", annotated)
+        cv2.waitKey(1)
 
     def _publish_twist(self, linear_x: float, angular_z: float) -> None:
         # Clamp commands to TurtleBot3 Burger limits for safety.
@@ -268,6 +313,7 @@ class AutonomousBottlePickPlace(Node):
         self.get_logger().info(f"Transition -> {new_state.name}")
 
     def _control_loop(self) -> None:
+        self._process_frame()
         # Run fixed-frequency controller (20 Hz).
         now = self._now_sec()
         det = self._tracker.get_fresh_bottle(now)
@@ -407,6 +453,12 @@ class AutonomousBottlePickPlace(Node):
         if self._state == TaskState.DONE:
             # Hold safe zero velocity when mission is complete.
             self._publish_twist(0.0, 0.0)
+
+    def destroy_node(self) -> None:
+        if hasattr(self, '_cap') and self._cap is not None:
+            self._cap.release()
+        cv2.destroyAllWindows()
+        super().destroy_node()
 
 
 def main(args: Optional[List[str]] = None) -> None:
